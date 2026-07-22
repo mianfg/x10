@@ -1,0 +1,40 @@
+{
+  "_about": "x10 manifest — copy to x10.json in your workspace root, then run: x10 gen",
+  "org": "my-github-org",
+  "projects": {
+    "my-feature": {
+      "repos": [
+        {
+          "repo": "my-api",
+          "pr": 42,
+          "_comment": "Track a PR — branch is resolved automatically via gh"
+        },
+        {
+          "repo": "my-frontend",
+          "branch": "feature/new-ui",
+          "_comment": "Explicit branch"
+        },
+        {
+          "repo": "shared-config",
+          "branch": "main",
+          "mode": "link",
+          "_comment": "Shared repo on main — linked, not a separate worktree"
+        }
+      ]
+    },
+    "maintenance": {
+      "repos": [
+        {
+          "repo": "other-org/their-lib",
+          "branch": "main",
+          "_comment": "Org-qualified: overrides the default org above"
+        },
+        {
+          "repo": "my-infra",
+          "branch": "master",
+          "mode": "link"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,590 @@
+#!/usr/bin/env bash
+#
+# x10 — multi-repo workspace manager
+#
+#   x10 init [dir] [--org ORG]    initialize a new workspace
+#   x10 ls                        list projects
+#   x10 cursor [project]          open project in Cursor (picker if omitted)
+#   x10 code   [project]          open project in VS Code
+#   x10 open   [project]          open in preferred editor ($X10_EDITOR / config)
+#   x10 status [project]          git status (all projects if omitted)
+#   x10 sync   [project]          fetch + fast-forward each repo (all if omitted)
+#   x10 prs    [project]          PR state per repo branch (all if omitted)
+#   x10 add <proj> <repo> [opts]  add a repo to a project
+#   x10 rm  <proj> <repo>         remove a repo from a project
+#   x10 cd [project [repo]]       change dir (requires shell function; see x10 setup)
+#   x10 gc [-y]                   remove worktrees whose PR is merged/closed
+#   x10 gen [args...]             regenerate workspace files from manifest
+#   x10 prune [args...]           report/remove orphaned worktrees
+#   x10 config [key [value]]      view or set user configuration
+#   x10 doctor                    check dependencies and configuration
+#   x10 setup                     install shell integration into ~/.zshrc
+#   x10 --version                 print version
+#
+set -euo pipefail
+
+X10_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Paths & config
+# ---------------------------------------------------------------------------
+
+X10_BIN_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+X10_GEN="$X10_BIN_DIR/x10-gen"
+X10_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/x10"
+X10_CONFIG="$X10_CONFIG_DIR/config.json"
+
+_read_config() {
+  [ -f "$X10_CONFIG" ] && jq -r --arg k "$1" '.[$k] // empty' "$X10_CONFIG" 2>/dev/null || true
+}
+
+_write_config() {
+  mkdir -p "$X10_CONFIG_DIR"
+  if [ -f "$X10_CONFIG" ]; then
+    local tmp; tmp=$(jq --arg k "$1" --arg v "$2" '.[$k] = $v' "$X10_CONFIG")
+    printf '%s\n' "$tmp" > "$X10_CONFIG"
+  else
+    jq -n --arg k "$1" --arg v "$2" '{($k): $v}' > "$X10_CONFIG"
+  fi
+}
+
+X10_ROOT="${X10_ROOT:-$(_read_config root)}"
+X10_ROOT="${X10_ROOT:-$HOME/x10}"
+export X10_ROOT
+MANIFEST="$X10_ROOT/x10.json"
+PROJECTS_DIR="$X10_ROOT/projects"
+
+die() { printf 'x10: %s\n' "$*" >&2; exit 1; }
+
+resolve_editor() {
+  local editor="${X10_EDITOR:-$(_read_config editor)}"
+  if [ -z "$editor" ]; then
+    if command -v cursor >/dev/null 2>&1; then editor="cursor"
+    elif command -v code >/dev/null 2>&1; then editor="code"
+    else die "no editor found; run: x10 config editor <name>"; fi
+  fi
+  echo "$editor"
+}
+
+# ---------------------------------------------------------------------------
+# Project helpers
+# ---------------------------------------------------------------------------
+
+list_projects() {
+  [ -f "$MANIFEST" ] || return 0
+  jq -r '.projects | keys[]' "$MANIFEST"
+}
+
+pick_project() {
+  if command -v fzf >/dev/null 2>&1; then
+    list_projects | fzf --prompt="project> " --height=40% --reverse
+    return
+  fi
+  local opts=() i=1 choice
+  while IFS= read -r line; do opts+=("$line"); done < <(list_projects)
+  [ "${#opts[@]}" -gt 0 ] || die "no projects in manifest"
+  for line in "${opts[@]}"; do printf '%2d) %s\n' "$i" "$line" >&2; i=$((i+1)); done
+  printf 'select> ' >&2
+  read -r choice </dev/tty 2>/dev/null || choice=""
+  case "$choice" in
+    ''|*[!0-9]*) return 1 ;;
+    *) [ "$choice" -ge 1 ] && [ "$choice" -le "${#opts[@]}" ] && echo "${opts[$((choice-1))]}" ;;
+  esac
+}
+
+resolve_project() {
+  local p="${1:-}"
+  [ -n "$p" ] || p="$(pick_project)" || die "no project selected"
+  [ -n "$p" ] || die "no project selected"
+  [ -d "$PROJECTS_DIR/$p" ] || die "unknown project: $p (have: $(list_projects | paste -sd' ' -))"
+  echo "$p"
+}
+
+project_from_cwd() {
+  local cwd; cwd="$(pwd -P)"
+  case "$cwd" in
+    "$X10_ROOT"/worktrees/*) local rel="${cwd#"$X10_ROOT"/worktrees/}"; echo "${rel%%/*}" ;;
+    "$X10_ROOT"/projects/*)  local rel="${cwd#"$X10_ROOT"/projects/}";  echo "${rel%%/*}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Absolute paths for every repo in a project (reads the workspace file).
+project_repo_paths() {
+  local proj="$1"
+  local ws="$PROJECTS_DIR/$proj/$proj.code-workspace"
+  [ -f "$ws" ] || return 1
+  local proj_dir="$PROJECTS_DIR/$proj"
+  jq -r '.folders[] | select(.name != "_project") | .path' "$ws" | while IFS= read -r rel; do
+    (cd "$proj_dir/$rel" >/dev/null 2>&1 && pwd -P) || true
+  done
+}
+
+# Run a callback-style loop over one or all projects.
+_for_projects() {
+  local callback="$1" proj="${2:-}"
+  if [ -n "$proj" ]; then
+    proj="$(resolve_project "$proj")"
+    "$callback" "$proj"
+  else
+    local p
+    for p in $(list_projects); do
+      [ -d "$PROJECTS_DIR/$p" ] || continue
+      printf '\n### %s ###\n' "$p"
+      "$callback" "$p"
+    done
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Editor commands
+# ---------------------------------------------------------------------------
+
+cmd_open_editor() {
+  local editor="$1" proj; proj="$(resolve_project "${2:-}")"
+  command -v "$editor" >/dev/null 2>&1 || die "$editor not found"
+  "$editor" "$PROJECTS_DIR/$proj/$proj.code-workspace"
+}
+
+cmd_open() {
+  local proj="${1:-}"
+  if [ -z "$proj" ]; then
+    proj="$(project_from_cwd)" || die "not inside a workspace; pass a project name or cd into one"
+  else
+    proj="$(resolve_project "$proj")"
+  fi
+  local editor; editor="$(resolve_editor)"
+  command -v "$editor" >/dev/null 2>&1 || die "$editor not found (run: x10 config editor <name>)"
+  "$editor" "$PROJECTS_DIR/$proj/$proj.code-workspace"
+}
+
+# ---------------------------------------------------------------------------
+# status / sync / prs  (direct implementation — no just dependency)
+# ---------------------------------------------------------------------------
+
+_cmd_status() {
+  local proj="$1"
+  project_repo_paths "$proj" | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    echo "== $(basename "$p") =="
+    git -C "$p" status --short --branch
+    echo
+  done
+}
+cmd_status() { _for_projects _cmd_status "${1:-}"; }
+
+_cmd_sync() {
+  local proj="$1"
+  project_repo_paths "$proj" | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    echo "== $(basename "$p") =="
+    git -C "$p" fetch origin --prune --quiet
+    if [ -n "$(git -C "$p" status --porcelain)" ]; then
+      echo "  dirty — skipped"
+    elif git -C "$p" rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then
+      if git -C "$p" merge --ff-only @{u} >/dev/null 2>&1; then
+        echo "  ok ($(git -C "$p" branch --show-current))"
+      else
+        echo "  diverged — skipped (resolve manually)"
+      fi
+    else
+      echo "  no upstream — skipped"
+    fi
+  done
+}
+cmd_sync() { _for_projects _cmd_sync "${1:-}"; }
+
+_cmd_prs() {
+  local proj="$1"
+  project_repo_paths "$proj" | while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    local br; br="$(git -C "$p" branch --show-current)"
+    printf '%-22s %-44s ' "$(basename "$p")" "$br"
+    ( cd "$p" && gh pr view "$br" --json number,state,isDraft,title \
+        -q '"#\(.number) \(.state)\(if .isDraft then "/draft" else "" end)  \(.title)"' 2>/dev/null ) \
+      || echo "(no open PR)"
+  done
+}
+cmd_prs() { _for_projects _cmd_prs "${1:-}"; }
+
+# ---------------------------------------------------------------------------
+# gc
+# ---------------------------------------------------------------------------
+
+cmd_gc() {
+  local yes=0; [ "${1:-}" = "-y" ] || [ "${1:-}" = "--yes" ] && yes=1
+  command -v gh >/dev/null 2>&1 || die "gh required for gc"
+  local repos_dir line wt repo branch state reply found=0
+  for repos_dir in "$X10_ROOT"/repos/*; do
+    [ -d "$repos_dir/.git" ] || continue
+    while IFS= read -r line; do
+      wt="${line#worktree }"
+      case "$wt" in "$X10_ROOT"/worktrees/*) ;; *) continue ;; esac
+      repo="$(basename "$wt")"
+      branch="$(git -C "$wt" branch --show-current 2>/dev/null)" || continue
+      [ -n "$branch" ] || continue
+      state="$(cd "$wt" && gh pr view "$branch" --json state -q .state 2>/dev/null)" || continue
+      case "$state" in MERGED|CLOSED) ;; *) continue ;; esac
+      found=1
+      if [ -n "$(git -C "$wt" status --porcelain)" ]; then
+        echo "  $wt  [$branch: $state]  DIRTY — skipped"
+        continue
+      fi
+      if [ "$yes" != "1" ]; then
+        printf 'PR for %s is %s. Remove worktree %s ? [y/N] ' "$branch" "$state" "$wt" >&2
+        read -r reply </dev/tty 2>/dev/null || reply=""
+        case "$reply" in y|Y|yes) ;; *) echo "  skipped $wt"; continue ;; esac
+      fi
+      git -C "$repos_dir" worktree remove "$wt" \
+        && echo "  removed $wt  (also delete its entry from x10.json)"
+    done < <(git -C "$repos_dir" worktree list --porcelain | grep '^worktree ')
+  done
+  [ "$found" -eq 0 ] && echo "  no merged/closed-PR worktrees found"
+}
+
+# ---------------------------------------------------------------------------
+# init
+# ---------------------------------------------------------------------------
+
+cmd_init() {
+  local org="" editor="" dir=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --org)    org="${2:-}"; shift 2 || die "init: --org requires a value" ;;
+      --editor) editor="${2:-}"; shift 2 || die "init: --editor requires a value" ;;
+      -*)       die "init: unknown flag '$1'" ;;
+      *)        [ -z "$dir" ] || die "init: unexpected argument '$1'"
+                dir="$1"; shift ;;
+    esac
+  done
+
+  # Resolve target directory
+  if [ -n "$dir" ]; then
+    mkdir -p "$dir"
+    dir="$(cd "$dir" && pwd -P)"
+  else
+    dir="$X10_ROOT"
+    mkdir -p "$dir"
+  fi
+
+  [ ! -f "$dir/x10.json" ] || die "init: $dir/x10.json already exists"
+
+  mkdir -p "$dir"/{repos,worktrees,projects}
+
+  # Default org: flag > global config > empty
+  [ -z "$org" ] && org="$(_read_config default_org)"
+  if [ -n "$org" ]; then
+    jq -n --arg org "$org" '{"org": $org, "projects": {}}' > "$dir/x10.json"
+  else
+    printf '%s\n' '{"projects": {}}' | jq '.' > "$dir/x10.json"
+  fi
+
+  # Save to global config
+  _write_config root "$dir"
+  [ -n "$editor" ] && _write_config editor "$editor"
+  [ -n "$org" ] && _write_config default_org "$org"
+
+  echo "Initialized x10 workspace at $dir"
+  echo ""
+  echo "Next steps:"
+  [ -z "$editor" ] && echo "  x10 config editor <name>    # set your editor (cursor, code, ...)"
+  echo "  x10 setup                   # install shell integration"
+  echo "  x10 add <project> <repo>    # add your first repo"
+}
+
+# ---------------------------------------------------------------------------
+# config
+# ---------------------------------------------------------------------------
+
+cmd_config() {
+  local key="${1:-}" value="${2:-}"
+  local valid_keys="editor default_org root"
+
+  if [ -z "$key" ]; then
+    # Show all config
+    echo "Config: $X10_CONFIG"
+    if [ -f "$X10_CONFIG" ]; then
+      jq '.' "$X10_CONFIG"
+    else
+      echo "(no config file yet)"
+    fi
+    return
+  fi
+
+  case " $valid_keys " in
+    *" $key "*) ;;
+    *) die "config: unknown key '$key' (valid: $valid_keys)" ;;
+  esac
+
+  if [ -z "$value" ]; then
+    # Get
+    local v; v="$(_read_config "$key")"
+    if [ -n "$v" ]; then echo "$v"; else echo "(not set)"; fi
+  else
+    # Set
+    _write_config "$key" "$value"
+    echo "Set $key = $value"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# add / rm
+# ---------------------------------------------------------------------------
+
+_ensure_manifest() {
+  [ -f "$MANIFEST" ] && return 0
+  die "no workspace found at $X10_ROOT — run: x10 init"
+}
+
+cmd_add() {
+  [ "$#" -ge 2 ] || die "add: usage: x10 add <project> <repo> [--pr N | --branch B] [--mode link|worktree]"
+  local project="$1" repo_spec="$2"; shift 2
+  [ -n "$project" ] || die "add: project name required"
+  [ -n "$repo_spec" ] || die "add: repo name required"
+
+  local pr="" branch="" mode=""
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --pr)     pr="${2:-}"; shift 2 || die "add: --pr requires a value" ;;
+      --branch) branch="${2:-}"; shift 2 || die "add: --branch requires a value" ;;
+      --mode)   mode="${2:-}"; shift 2 || die "add: --mode requires a value" ;;
+      *)        die "add: unknown option '$1'" ;;
+    esac
+  done
+
+  [ -n "$pr" ] && [ -n "$branch" ] && die "add: --pr and --branch are mutually exclusive"
+  [ -z "$mode" ] && mode="worktree"
+  [[ "$mode" == "link" || "$mode" == "worktree" ]] || die "add: --mode must be 'link' or 'worktree'"
+
+  _ensure_manifest
+
+  # Default branch: detect from local clone or GitHub API
+  if [ -z "$pr" ] && [ -z "$branch" ]; then
+    local local_name="${repo_spec##*/}"
+    if [ -d "$X10_ROOT/repos/$local_name/.git" ]; then
+      branch="$(git -C "$X10_ROOT/repos/$local_name" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null \
+        | sed 's|refs/remotes/origin/||')" || true
+    fi
+    if [ -z "$branch" ]; then
+      local org
+      if [[ "$repo_spec" == */* ]]; then org="${repo_spec%%/*}"; else org="$(jq -r '.org // empty' "$MANIFEST")"; fi
+      [ -n "$org" ] || org="$(_read_config default_org)"
+      [ -n "$org" ] || die "add: cannot infer org; use org/repo syntax or run: x10 config default_org <org>"
+      command -v gh >/dev/null 2>&1 || die "add: gh required to detect default branch (or pass --branch explicitly)"
+      branch="$(gh api "repos/$org/$local_name" --jq .default_branch 2>/dev/null)" \
+        || die "add: could not detect default branch for $org/$local_name"
+    fi
+  fi
+
+  # Ensure project with repos array exists in manifest
+  if ! jq -e --arg p "$project" '.projects[$p].repos' "$MANIFEST" >/dev/null 2>&1; then
+    local tmp; tmp=$(jq --arg p "$project" '
+      if .projects[$p] then .projects[$p].repos = []
+      else .projects[$p] = {"repos": []}
+      end' "$MANIFEST")
+    printf '%s\n' "$tmp" > "$MANIFEST"
+    mkdir -p "$X10_ROOT/projects/$project"
+    echo "Created project '$project'"
+  fi
+
+  # Check for duplicates (match by local name)
+  local local_name="${repo_spec##*/}"
+  if jq -e --arg p "$project" --arg r "$local_name" \
+     '.projects[$p].repos[]? | select((.repo | split("/") | .[-1]) == $r)' \
+     "$MANIFEST" >/dev/null 2>&1; then
+    die "add: '$local_name' already exists in project '$project'"
+  fi
+
+  # Build entry JSON
+  local entry="{}"
+  entry=$(jq --arg r "$repo_spec" '.repo = $r' <<<"$entry")
+  if [ -n "$pr" ]; then
+    entry=$(jq --argjson pr "$pr" '.pr = $pr' <<<"$entry")
+  else
+    entry=$(jq --arg b "$branch" '.branch = $b' <<<"$entry")
+  fi
+  [ "$mode" = "worktree" ] || entry=$(jq --arg m "$mode" '.mode = $m' <<<"$entry")
+
+  # Write manifest and regenerate
+  local tmp; tmp=$(jq --arg p "$project" --argjson e "$entry" \
+    '.projects[$p].repos += [$e]' "$MANIFEST")
+  printf '%s\n' "$tmp" > "$MANIFEST"
+
+  echo "Added $repo_spec to '$project'"
+  "$X10_GEN" "$project"
+}
+
+cmd_rm() {
+  [ "$#" -ge 2 ] || die "rm: usage: x10 rm <project> <repo>"
+  local project="$1" repo="$2"
+  [ -n "$project" ] || die "rm: project name required"
+  [ -n "$repo" ] || die "rm: repo name required"
+
+  _ensure_manifest
+
+  local local_name="${repo##*/}"
+
+  if ! jq -e --arg p "$project" --arg r "$local_name" \
+     '.projects[$p].repos[]? | select((.repo | split("/") | .[-1]) == $r)' \
+     "$MANIFEST" >/dev/null 2>&1; then
+    die "rm: '$local_name' not found in project '$project'"
+  fi
+
+  local tmp; tmp=$(jq --arg p "$project" --arg r "$local_name" \
+    '.projects[$p].repos = [.projects[$p].repos[] | select((.repo | split("/") | .[-1]) != $r)]' \
+    "$MANIFEST")
+  printf '%s\n' "$tmp" > "$MANIFEST"
+
+  echo "Removed '$local_name' from '$project'"
+  "$X10_GEN" "$project"
+  echo "Run 'x10 prune --remove' to clean up orphaned worktrees."
+}
+
+# ---------------------------------------------------------------------------
+# doctor / setup
+# ---------------------------------------------------------------------------
+
+cmd_doctor() {
+  local ok=1
+  _chk() {
+    local name="$1" required="$2" desc="$3"
+    if command -v "$name" >/dev/null 2>&1; then
+      printf '  ✓  %-10s  %s\n' "$name" "$(command -v "$name")"
+    elif [ "$required" = "required" ]; then
+      printf '  ✗  %-10s  MISSING (required) — %s\n' "$name" "$desc"
+      ok=0
+    else
+      printf '  -  %-10s  not found (optional) — %s\n' "$name" "$desc"
+    fi
+  }
+
+  echo "Dependencies:"
+  _chk git     required "version control"
+  _chk jq      required "JSON processing"
+  _chk gh      required "GitHub CLI (PR resolution, gc, prs)"
+  _chk just    optional "task runner (per-project justfile recipes)"
+  _chk direnv  optional "auto-load .envrc per project"
+  _chk fzf     optional "interactive project picker"
+
+  echo ""
+  echo "Workspace:"
+  printf '  root: %s\n' "$X10_ROOT"
+  if [ -f "$MANIFEST" ]; then
+    printf '  ✓  %s\n' "$MANIFEST"
+    local org; org=$(jq -r '.org // empty' "$MANIFEST")
+    if [ -n "$org" ]; then
+      printf '  ✓  default org: %s\n' "$org"
+    else
+      printf '  -  no "org" in manifest (use org/repo syntax or x10 config default_org)\n'
+    fi
+    local count; count=$(jq '.projects | length' "$MANIFEST")
+    printf '     %s project(s)\n' "$count"
+  else
+    printf '  ✗  %s not found — run: x10 init\n' "$MANIFEST"
+    ok=0
+  fi
+
+  echo ""
+  echo "Config:"
+  if [ -f "$X10_CONFIG" ]; then
+    printf '  ✓  %s\n' "$X10_CONFIG"
+    local editor; editor="$(_read_config editor)"
+    [ -n "$editor" ] && printf '     editor: %s\n' "$editor" || printf '     editor: (auto-detect)\n'
+  else
+    printf '  -  %s (not created yet)\n' "$X10_CONFIG"
+  fi
+
+  echo ""
+  echo "Shell integration:"
+  local rcfile="${ZDOTDIR:-$HOME}/.zshrc"
+  if grep -qF 'x10 workspace shell integration' "$rcfile" 2>/dev/null; then
+    printf '  ✓  sourced in %s\n' "$rcfile"
+  else
+    printf '  ✗  not in %s — run: x10 setup\n' "$rcfile"
+    ok=0
+  fi
+
+  echo ""
+  if [ "$ok" -eq 1 ]; then
+    echo "All good."
+  else
+    echo "Issues found — fix them and re-run: x10 doctor"
+    return 1
+  fi
+}
+
+cmd_setup() {
+  local marker_start="# >>> x10 workspace shell integration >>>"
+  local marker_end="# <<< x10 workspace shell integration <<<"
+  local old_marker="# >>> dev workspace shell integration >>>"
+  local rcfile="${ZDOTDIR:-$HOME}/.zshrc"
+  local init_file="$X10_BIN_DIR/shell-init.zsh"
+
+  [ -f "$init_file" ] || die "setup: shell-init.zsh not found at $X10_BIN_DIR"
+
+  # Check for existing x10 block
+  if grep -qF "$marker_start" "$rcfile" 2>/dev/null; then
+    echo "Shell integration already present in $rcfile"
+    echo "To reinstall, remove the block between the >>> and <<< markers and re-run."
+    return 0
+  fi
+
+  # Warn about old dev block
+  if grep -qF "$old_marker" "$rcfile" 2>/dev/null; then
+    echo "Note: found old 'dev' shell integration in $rcfile — you can remove that block."
+  fi
+
+  [ -f "$rcfile" ] || touch "$rcfile"
+
+  {
+    echo ""
+    echo "$marker_start"
+    echo "source \"$init_file\""
+    echo "$marker_end"
+  } >> "$rcfile"
+
+  echo "Added shell integration to $rcfile"
+  echo "Run 'source $rcfile' or open a new terminal to activate."
+}
+
+# ---------------------------------------------------------------------------
+
+usage() { sed -n '3,22p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  case "${1:-}" in --version|-V) echo "x10 $X10_VERSION"; exit 0 ;; esac
+
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    ls|list)   list_projects ;;
+    cursor)    cmd_open_editor cursor "${1:-}" ;;
+    code)      cmd_open_editor code   "${1:-}" ;;
+    open)      cmd_open "${1:-}" ;;
+    status)    cmd_status "${1:-}" ;;
+    sync)      cmd_sync   "${1:-}" ;;
+    prs)       cmd_prs    "${1:-}" ;;
+    gc)        cmd_gc "${1:-}" ;;
+    init)      cmd_init "$@" ;;
+    config)    cmd_config "$@" ;;
+    add)       cmd_add "$@" ;;
+    rm)        cmd_rm "$@" ;;
+    doctor)    cmd_doctor ;;
+    setup)     cmd_setup ;;
+    gen)       _ensure_manifest; "$X10_GEN" "$@" ;;
+    prune)     _ensure_manifest; "$X10_GEN" prune "$@" ;;
+    _path)     # internal helper for the `x10 cd` shell function
+               local proj repo; proj="$(resolve_project "${1:-}")"
+               if [ -n "${2:-}" ]; then
+                 repo="$2"
+                 if [ -d "$X10_ROOT/worktrees/$proj/$repo" ]; then echo "$X10_ROOT/worktrees/$proj/$repo";
+                 elif [ -d "$X10_ROOT/repos/$repo" ]; then echo "$X10_ROOT/repos/$repo";
+                 else die "no such repo '$repo' in project '$proj'"; fi
+               else
+                 echo "$PROJECTS_DIR/$proj"
+               fi ;;
+    ""|help|-h|--help) usage ;;
+    *) die "unknown command '$cmd' (try: x10 help)" ;;
+  esac
+}
+
+main "$@"

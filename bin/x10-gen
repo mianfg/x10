@@ -1,0 +1,397 @@
+#!/usr/bin/env bash
+#
+# x10-gen — materialize workspace projects from x10.json
+#
+# Reads the manifest and, for every project/repo entry:
+#   - resolves the target branch (from `pr` via gh, or explicit `branch`)
+#   - mode "worktree": ensures a git worktree at worktrees/<project>/<repo>
+#   - mode "link":     references the canonical clone at repos/<repo> (no worktree)
+# then (re)generates each project's <project>.code-workspace, .envrc and justfile.
+#
+# Idempotent: re-running is safe. It never deletes worktrees or repos
+# unless you explicitly ask (`prune --remove`).
+#
+# Usage:
+#   x10-gen                           # generate all projects
+#   x10-gen <project>...              # generate only the named projects
+#   x10-gen --switch [<proj>...]      # also re-point existing CLEAN worktrees to the manifest branch
+#   x10-gen prune                     # report worktrees not described by the manifest
+#   x10-gen prune --remove [-y]       # remove orphaned CLEAN worktrees (asks unless -y)
+#
+# Missing canonical clones are cloned automatically from the manifest org
+# (override with WS_GIT_ORG=... or a top-level "org" key in the manifest).
+# Repo entries may be org-qualified ("other-org/repo") to override the default.
+#
+set -euo pipefail
+
+# Resolve X10_ROOT: env var > user config > default
+if [ -z "${X10_ROOT:-}" ]; then
+  _x10_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/x10/config.json"
+  [ -f "$_x10_cfg" ] && X10_ROOT="$(jq -r '.root // empty' "$_x10_cfg" 2>/dev/null)" || true
+  unset _x10_cfg
+fi
+X10_ROOT="${X10_ROOT:-$HOME/x10}"
+export X10_ROOT
+MANIFEST="${MANIFEST:-$X10_ROOT/x10.json}"
+
+for t in git jq; do
+  command -v "$t" >/dev/null 2>&1 || { echo "FATAL: required tool '$t' not found" >&2; exit 1; }
+done
+[ -f "$MANIFEST" ] || { echo "FATAL: manifest not found: $MANIFEST" >&2; exit 1; }
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'WARN: %s\n' "$*" >&2; }
+die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
+
+# repo name -> env var prefix (data-fever-mcp -> DATA_FEVER_MCP)
+env_prefix() { echo "$1" | tr '[:lower:]-' '[:upper:]_'; }
+
+# Extract the local folder name from a possibly org-qualified repo spec.
+#   "other-org/repo" -> "repo"    "repo" -> "repo"
+repo_local_name() { echo "${1##*/}"; }
+
+# Extract the org from a repo spec, falling back to the manifest default.
+repo_clone_org() {
+  if [[ "$1" == */* ]]; then echo "${1%%/*}"
+  else git_org; fi
+}
+
+SWITCH=0          # set by --switch
+_ORG_CACHE=""     # memoized GitHub org
+
+# Infer the GitHub org from the manifest, env, or an existing clone's remote.
+git_org() {
+  if [ -n "$_ORG_CACHE" ]; then echo "$_ORG_CACHE"; return; fi
+  local org url d
+  org="${WS_GIT_ORG:-$(jq -r '.org // empty' "$MANIFEST")}"
+  if [ -z "$org" ]; then
+    for d in "$X10_ROOT"/repos/*/.git; do
+      [ -e "$d" ] || continue
+      url=$(git -C "${d%/.git}" remote get-url origin 2>/dev/null) || continue
+      case "$url" in
+        git@github.com:*/*)      org="${url#git@github.com:}"; org="${org%%/*}"; break ;;
+        https://github.com/*/*)  org="${url#https://github.com/}"; org="${org%%/*}"; break ;;
+      esac
+    done
+  fi
+  [ -n "$org" ] || die "could not infer GitHub org; set WS_GIT_ORG or add \"org\" to x10.json"
+  _ORG_CACHE="$org"; echo "$org"
+}
+
+# Ensure repos/<name> exists as a clone; clone from the inferred or explicit org.
+# Accepts plain "repo" (uses default org) or "org/repo" (uses given org).
+ensure_canonical() {
+  local spec="$1"
+  local name; name="$(repo_local_name "$spec")"
+  local canonical="$X10_ROOT/repos/$name" org
+  [ -d "$canonical/.git" ] && return 0
+  [ -e "$canonical" ] && die "$canonical exists but is not a git repo"
+  org="$(repo_clone_org "$spec")"
+  log "  cloning $name from git@github.com:$org/$name.git"
+  git clone --quiet "git@github.com:$org/$name.git" "$canonical" \
+    || die "$name: clone failed (check org '$org' and SSH access)"
+}
+
+# Switch a clean worktree to <branch>, creating a tracking branch if needed.
+checkout_branch() {
+  local wt="$1" branch="$2"
+  git -C "$wt" fetch origin --prune --quiet || true
+  if git -C "$wt" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$wt" switch "$branch" >/dev/null
+  elif git -C "$wt" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git -C "$wt" switch -c "$branch" --track "origin/$branch" >/dev/null
+  else
+    die "cannot switch $wt: branch '$branch' not found locally or on origin"
+  fi
+}
+
+# Resolve the branch for a repo entry (JSON object on stdin arg).
+resolve_branch() {
+  local repo="$1" entry="$2" pr branch
+  pr=$(jq -r '.pr // empty' <<<"$entry")
+  branch=$(jq -r '.branch // empty' <<<"$entry")
+  if [ -n "$pr" ] && [ -n "$branch" ]; then
+    die "$repo: entry has both 'pr' and 'branch'; pick one"
+  fi
+  if [ -n "$pr" ]; then
+    command -v gh >/dev/null 2>&1 || die "$repo: entry uses 'pr' but gh is not installed"
+    ( cd "$X10_ROOT/repos/$repo" && gh pr view "$pr" --json headRefName -q .headRefName ) \
+      || die "$repo: could not resolve PR #$pr via gh"
+  elif [ -n "$branch" ]; then
+    echo "$branch"
+  else
+    die "$repo: entry has neither 'pr' nor 'branch'"
+  fi
+}
+
+# Ensure a worktree exists at worktrees/<project>/<repo> on <branch>.
+ensure_worktree() {
+  local repo="$1" project="$2" branch="$3"
+  local canonical="$X10_ROOT/repos/$repo"
+  local wt="$X10_ROOT/worktrees/$project/$repo"
+
+  ensure_canonical "$repo"
+
+  if git -C "$canonical" worktree list --porcelain | grep -qx "worktree $wt"; then
+    local cur
+    cur=$(git -C "$wt" branch --show-current 2>/dev/null || echo "?")
+    if [ "$cur" = "$branch" ]; then
+      log "  ok      $project/$repo @ $branch (worktree exists)"
+    elif [ "$SWITCH" = "1" ]; then
+      if [ -n "$(git -C "$wt" status --porcelain)" ]; then
+        warn "$project/$repo: worktree on '$cur' is DIRTY; not switching to '$branch'"
+      else
+        checkout_branch "$wt" "$branch"
+        log "  switch  $project/$repo: $cur -> $branch"
+      fi
+    else
+      warn "$project/$repo: worktree on '$cur' but manifest wants '$branch'. Re-run with --switch (clean only), or:"
+      warn "    git -C \"$wt\" switch $branch"
+    fi
+    return 0
+  fi
+  if [ -e "$wt" ]; then
+    die "$wt exists but is not a registered worktree; remove it manually first"
+  fi
+
+  mkdir -p "$(dirname "$wt")"
+  git -C "$canonical" fetch origin --prune --quiet || warn "fetch failed for $repo (offline?), continuing"
+
+  # If the canonical clone has this branch checked out, detach it so the worktree can use it.
+  local canon_branch
+  canon_branch=$(git -C "$canonical" branch --show-current 2>/dev/null) || true
+  if [ "$canon_branch" = "$branch" ]; then
+    git -C "$canonical" checkout --detach --quiet 2>/dev/null || true
+  fi
+
+  if git -C "$canonical" show-ref --verify --quiet "refs/heads/$branch"; then
+    git -C "$canonical" worktree add "$wt" "$branch" >/dev/null
+  elif git -C "$canonical" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+    git -C "$canonical" worktree add --track -b "$branch" "$wt" "origin/$branch" >/dev/null
+  else
+    die "$repo: branch '$branch' not found locally or on origin"
+  fi
+  log "  created $project/$repo @ $branch"
+}
+
+write_workspace() { # project, folders-json
+  local project="$1" folders="$2" out="$X10_ROOT/projects/$project/$project.code-workspace"
+  jq -n --argjson folders "$folders" '{
+    folders: $folders,
+    settings: {
+      "workbench.editor.labelFormat": "medium",
+      "files.exclude": {
+        "**/.direnv": true,
+        "**/node_modules": true,
+        "**/.venv": true,
+        "**/__pycache__": true
+      }
+    }
+  }' > "$out"
+  log "  wrote   $out"
+}
+
+write_envrc() { # project, env-body, newline-separated path list
+  local project="$1" body="$2" pathlist="$3" out="$X10_ROOT/projects/$project/.envrc"
+  {
+    echo "# Generated by x10-gen — do not edit by hand; edit x10.json instead."
+    echo "export X10_ROOT=\"\$HOME/${X10_ROOT#"$HOME"/}\""
+    echo "export X10_PROJECT=\"$project\""
+    echo "export X10_PROJECT_DIR=\"\$X10_ROOT/projects/$project\""
+    printf '%s' "$body"
+    if [ -n "$pathlist" ]; then
+      echo "# Newline-separated list of this project's repo paths."
+      echo "export X10_REPO_PATHS=\"${pathlist%$'\n'}\""
+    fi
+  } > "$out"
+  if command -v direnv >/dev/null 2>&1; then
+    direnv allow "$X10_ROOT/projects/$project" >/dev/null 2>&1 || true
+  fi
+  log "  wrote   $out"
+}
+
+write_justfile() { # project
+  local project="$1" out="$X10_ROOT/projects/$project/justfile"
+  cat > "$out" <<'JUST'
+set shell := ["bash", "-uc"]
+
+project_dir := justfile_directory()
+project := file_name(project_dir)
+workspace := project_dir / (project + ".code-workspace")
+
+_paths:
+    @jq -r '.folders[] | select(.name != "_project") | .path' "{{workspace}}" | while read -r rel; do (cd "{{project_dir}}/$rel" >/dev/null 2>&1 && pwd -P); done
+
+default:
+    @just --list
+
+info:
+    @echo "Project: {{project}}  ({{project_dir}})"
+    @just _paths
+
+status:
+    @just _paths | while read -r p; do echo "== $(basename "$p") =="; git -C "$p" status --short --branch; echo; done
+
+branches:
+    @just _paths | while read -r p; do printf '%-22s ' "$(basename "$p")"; git -C "$p" branch --show-current; done
+
+fetch:
+    @just _paths | while read -r p; do echo "== $(basename "$p") =="; git -C "$p" fetch origin --prune; done
+
+sync:
+    @just _paths | while read -r p; do \
+      echo "== $(basename "$p") =="; \
+      git -C "$p" fetch origin --prune --quiet; \
+      if [ -n "$(git -C "$p" status --porcelain)" ]; then echo "  dirty — skipped"; \
+      elif git -C "$p" rev-parse --abbrev-ref --symbolic-full-name @{u} >/dev/null 2>&1; then \
+        if git -C "$p" merge --ff-only @{u} >/dev/null 2>&1; then echo "  ok ($(git -C "$p" branch --show-current))"; \
+        else echo "  diverged — skipped (resolve manually)"; fi; \
+      else echo "  no upstream — skipped"; fi; \
+    done
+
+prs:
+    @just _paths | while read -r p; do \
+      br="$(git -C "$p" branch --show-current)"; \
+      printf '%-22s %-44s ' "$(basename "$p")" "$br"; \
+      ( cd "$p" && gh pr view "$br" --json number,state,isDraft,title \
+          -q '"#\(.number) \(.state)\(if .isDraft then "/draft" else "" end)  \(.title)"' 2>/dev/null ) \
+        || echo "(no open PR)"; \
+    done
+
+cursor:
+    cursor "{{workspace}}"
+
+code:
+    code "{{workspace}}"
+JUST
+  log "  wrote   $out"
+}
+
+gen_project() {
+  local project="$1"
+  log "project: $project"
+  mkdir -p "$X10_ROOT/projects/$project"
+
+  local count
+  count=$(jq -r --arg p "$project" '.projects[$p].repos | length' "$MANIFEST")
+
+  local folders='[]' envbody=$'\n' pathlist=''
+  local i entry repo_spec repo mode branch relpath prefix abspath
+  for ((i=0; i<count; i++)); do
+    entry=$(jq -c --arg p "$project" --argjson i "$i" '.projects[$p].repos[$i]' "$MANIFEST")
+    repo_spec=$(jq -r '.repo' <<<"$entry")
+    [ -n "$repo_spec" ] && [ "$repo_spec" != "null" ] || die "$project: repo entry $i missing 'repo'"
+    repo=$(repo_local_name "$repo_spec")
+    mode=$(jq -r '.mode // "worktree"' <<<"$entry")
+    ensure_canonical "$repo_spec"
+    branch=$(resolve_branch "$repo" "$entry")
+
+    if [ "$mode" = "link" ]; then
+      relpath="../../repos/$repo"
+      abspath="\$X10_ROOT/repos/$repo"
+      log "  link    $project/$repo -> repos/$repo (@ $branch)"
+    elif [ "$mode" = "worktree" ]; then
+      ensure_worktree "$repo" "$project" "$branch"
+      relpath="../../worktrees/$project/$repo"
+      abspath="\$X10_ROOT/worktrees/$project/$repo"
+    else
+      die "$project/$repo: unknown mode '$mode' (use 'worktree' or 'link')"
+    fi
+
+    folders=$(jq --arg n "$repo" --arg pth "$relpath" '. + [{name:$n, path:$pth}]' <<<"$folders")
+    prefix=$(env_prefix "$repo")
+    envbody+="export ${prefix}_PATH=\"$abspath\""$'\n'
+    pathlist+="$abspath"$'\n'
+  done
+
+  folders=$(jq '. + [{name:"_project", path:"."}]' <<<"$folders")
+  write_workspace "$project" "$folders"
+  write_envrc "$project" "$envbody" "$pathlist"
+  write_justfile "$project"
+}
+
+# Is <project>/<repo> a worktree entry in the manifest?
+# Matches by local repo name (strips any org/ prefix from manifest entries).
+in_manifest() {
+  local project="$1" repo="$2"
+  jq -e --arg p "$project" --arg r "$repo" \
+     '.projects[$p].repos[]? | select((.repo | split("/") | .[-1]) == $r and (.mode // "worktree") == "worktree")' \
+     "$MANIFEST" >/dev/null 2>&1
+}
+
+cmd_prune() { # flags: --remove, -y/--yes
+  local remove=0 yes=0 a
+  for a in "$@"; do
+    case "$a" in
+      --remove) remove=1 ;;
+      -y|--yes) yes=1 ;;
+      *) die "prune: unknown flag '$a'" ;;
+    esac
+  done
+
+  log "prune: worktrees under worktrees/ vs manifest"
+  local found=0 line wt rel project repo repos_dir reply
+  for repos_dir in "$X10_ROOT"/repos/*; do
+    [ -d "$repos_dir/.git" ] || continue
+    while IFS= read -r line; do
+      wt="${line#worktree }"
+      case "$wt" in "$X10_ROOT"/worktrees/*) ;; *) continue ;; esac
+      rel="${wt#"$X10_ROOT"/worktrees/}"
+      project="${rel%%/*}"; repo="${rel#*/}"
+      if in_manifest "$project" "$repo"; then
+        log "  keep    $wt"
+        continue
+      fi
+      found=1
+      if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+        log "  ORPHAN  $wt   (DIRTY — will not remove)"
+        continue
+      fi
+      if [ "$remove" != "1" ]; then
+        log "  ORPHAN  $wt   (clean; pass --remove to delete)"
+        continue
+      fi
+      if [ "$yes" != "1" ]; then
+        printf 'Remove clean orphan worktree %s ? [y/N] ' "$wt" >&2
+        read -r reply </dev/tty 2>/dev/null || reply=""
+        case "$reply" in y|Y|yes) ;; *) log "  skipped $wt"; continue ;; esac
+      fi
+      git -C "$repos_dir" worktree remove "$wt" && log "  removed $wt"
+    done < <(git -C "$repos_dir" worktree list --porcelain | grep '^worktree ')
+  done
+  [ "$found" -eq 0 ] && log "  (no orphans)"
+}
+
+main() {
+  # Subcommand: prune
+  if [ "${1:-}" = "prune" ]; then shift; cmd_prune "$@"; return; fi
+
+  # Flags + positional project names
+  local positional=()
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --switch) SWITCH=1 ;;
+      --) shift; while [ "$#" -gt 0 ]; do positional+=("$1"); shift; done; break ;;
+      -*) die "unknown flag '$1' (see header for usage)" ;;
+      *) positional+=("$1") ;;
+    esac
+    shift
+  done
+
+  local projects
+  if [ "${#positional[@]}" -gt 0 ]; then
+    projects="${positional[*]}"
+  else
+    projects=$(jq -r '.projects | keys[]' "$MANIFEST")
+  fi
+  for p in $projects; do
+    jq -e --arg p "$p" '.projects[$p]' "$MANIFEST" >/dev/null \
+      || die "project '$p' not in manifest"
+    gen_project "$p"
+    log ""
+  done
+  [ "${PRUNE:-0}" = "1" ] && cmd_prune || true
+  log "done."
+}
+
+main "$@"

@@ -1,0 +1,15 @@
+# Workspace runtime directories — these are generated and contain user-specific data.
+# Commit x10.json (the manifest) but not the clones, worktrees, or generated project files.
+repos/
+worktrees/
+projects/
+
+# User manifest — contains org/repo names. Users create their own from x10.example.json.
+x10.json
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+*.swp
